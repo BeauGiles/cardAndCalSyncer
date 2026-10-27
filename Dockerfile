@@ -8,6 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 # Modules live flat in /app (main.py imports "from db import ...")
 COPY app/ /app/
+# vdirsyncer has no storage plugin hook. sitecustomize registers graph_contacts
+# in every Python process, including the vdirsyncer subprocess.
+RUN python -c "import pathlib, site; src=pathlib.Path('/app/sitecustomize.py'); dst=pathlib.Path(site.getsitepackages()[0])/'sitecustomize.py'; dst.write_bytes(src.read_bytes())"
 
 ENV CACS_DATA=/data \
     SYNC_INTERVAL=300 \

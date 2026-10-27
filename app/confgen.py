@@ -13,6 +13,10 @@ from store import storage_name, vpair_name
 
 STATUS_PATH = "/data/status/"
 TOKEN_DIR = "/data"
+# Shared by every Graph account. The plugin keys the file by client id, and the
+# path must be absolute: the sync subprocess sets HOME=/data, but Clear/enrich
+# run as the container user and would otherwise use a different ~/.cache.
+GRAPH_CACHE_DIR = "/data/graph-cache"
 
 ICLOUD_CAL_URL = "https://caldav.icloud.com/"
 ICLOUD_CARD_URL = "https://contacts.icloud.com/"
@@ -43,6 +47,21 @@ def _storage_block(account_id: str, acc: dict[str, Any], service: str,
             var = _sec_var(account_id, fld)
             env[var] = acc.get(fld, "") or ""
             out.append(f'{fld}.fetch = ["command", "printenv", "{var}"]')
+    elif kind == "graph":
+        # graph_calendar exists in the plugin; CaCs does not expose it.
+        if is_cal:
+            raise ValueError(
+                "Microsoft Graph calendar sync is not supported. Use a contacts pair."
+            )
+        # Lazy import: graphauth imports confgen. A module-level import cycles.
+        from graphauth import normalize_tenant
+        out.append(f'type = {_val("graph_contacts")}')
+        out.append(f'token_file = {_val(f"{TOKEN_DIR}/{name}.token")}')
+        out.append(f'cache_dir = {_val(GRAPH_CACHE_DIR)}')
+        out.append(f'tenant = {_val(normalize_tenant(acc.get("tenant")))}')
+        var = _sec_var(account_id, "client_id")
+        env[var] = acc.get("client_id", "") or ""
+        out.append(f'client_id.fetch = ["command", "printenv", "{var}"]')
     else:
         out.append(f'type = {_val("caldav" if is_cal else "carddav")}')
         if kind == "icloud":
@@ -147,9 +166,25 @@ def generate(cfg: dict[str, Any], *, only_pair: str | None = None,
             f"b = {_val(sb)}",
             "collections = [" + ", ".join(_val(c) for c in colls) + "]",
             f'conflict_resolution = {_val(conflict)}',
-            'metadata = ["displayname", "color"]' if svc == "calendar"
-            else 'metadata = ["displayname"]',
-            "",
         ]
+        # Graph set_meta raises. Syncing displayname against an iCloud address
+        # book name would fail the run. Omit metadata entirely for these pairs.
+        graph_pair = any(
+            accounts.get(p.get(side), {}).get("kind") == "graph" for side in ("a", "b")
+        )
+        if not graph_pair:
+            lines.append(
+                'metadata = ["displayname", "color"]' if svc == "calendar"
+                else 'metadata = ["displayname"]'
+            )
+        # One-way Graph pairs must not use vdirsyncer's default partial_sync
+        # ("revert"): Graph's read-back vCard does not hash-equal the source,
+        # so revert rewrites the Outlook folder on every run. "ignore" drops
+        # that attempt. vdirsyncer rejects partial_sync unless exactly one
+        # storage is read_only, so two-way pairs leave the default in place
+        # (the UI warns before enabling two-way).
+        if graph_pair and (readonly.get(sa, False) ^ readonly.get(sb, False)):
+            lines.append(f'partial_sync = {_val("ignore")}')
+        lines.append("")
 
     return "\n".join(lines) + "\n", env

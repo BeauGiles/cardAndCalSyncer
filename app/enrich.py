@@ -20,6 +20,8 @@ from typing import Any
 
 import aiohttp
 
+import confgen
+from graphauth import normalize_tenant
 from store import storage_name, vpair_name
 
 log = logging.getLogger("cacs.enrich")
@@ -100,7 +102,7 @@ def _collection_deltas(pair_id: str) -> dict[str, tuple[dict, dict]]:
 def build_collection_config(account_id: str, acc: dict[str, Any], service: str,
                             delta: dict) -> dict[str, Any] | None:
     """Reconstruct the resolved per-collection storage config (base + cache delta),
-    mirroring what vdirsyncer built at discover time. Works for DAV and Google.
+    mirroring what vdirsyncer built at discover time. Works for DAV, Google and Graph.
     """
     is_cal = service == "calendar"
     kind = acc.get("kind", "caldav")
@@ -110,6 +112,16 @@ def build_collection_config(account_id: str, acc: dict[str, Any], service: str,
             "token_file": f"{TOKEN_DIR}/{storage_name(account_id, service)}.token",
             "client_id": acc.get("client_id", "") or "",
             "client_secret": acc.get("client_secret", "") or "",
+        }
+    elif kind == "graph":
+        if is_cal:
+            return None
+        base = {
+            "type": "graph_contacts",
+            "token_file": f"{confgen.TOKEN_DIR}/{storage_name(account_id, service)}.token",
+            "client_id": acc.get("client_id", "") or "",
+            "tenant": normalize_tenant(acc.get("tenant")),
+            "cache_dir": confgen.GRAPH_CACHE_DIR,
         }
     elif kind == "icloud":
         base = {"type": "caldav" if is_cal else "carddav",

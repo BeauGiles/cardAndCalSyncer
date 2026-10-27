@@ -22,7 +22,7 @@ parses its output into a SQLite DB and shows everything in the browser.
 - Supported providers:
   - **iCloud** (CalDAV/CardDAV, app-specific password → full write access)
   - **Google** (Google's CalDAV & CardDAV APIs, OAuth2)
-  - **Microsoft / Outlook** and **any CalDAV/CardDAV server** (Nextcloud, Fastmail, mailbox.org, your own server …)
+  - **Microsoft 365 contacts** via Microsoft Graph (one-way, into an empty Outlook folder) and **any CalDAV/CardDAV server** (Nextcloud, Fastmail, mailbox.org, your own server …). Microsoft calendar via Graph is not supported. CalDAV to Microsoft only works when that account actually exposes CalDAV.
 - **Web UI** (port 8080): dashboard, activity (what/when/where/source→target), runs, live logs
 - **Fully configurable in the UI**: accounts, pairs, discovery, mappings, interval
 - **Login** with "stay signed in" and a guided first-time setup
@@ -97,7 +97,8 @@ To update: `docker compose pull && docker compose up -d`.
 |---|---|
 | **iCloud** | Apple ID + **app-specific password** (appleid.apple.com → Sign-In & Security; 2FA required) |
 | **Google** | OAuth client of type **"Web application"** from the Google Cloud Console; paste Client ID + secret, then click **"Connect Google"** — one browser consent, no CLI (see below) |
-| **Microsoft/Outlook** | Only if the account allows CalDAV/CardDAV — server URL + credentials. **Microsoft 365 / Graph is not supported** (vdirsyncer doesn't speak Graph) |
+| **Microsoft 365 contacts (Graph)** | Entra application (client) ID for a public client. Device-code sign-in in the UI. **Contacts only, one-way.** See below. |
+| **Microsoft/Outlook (CalDAV)** | Only if the account allows CalDAV/CardDAV — server URL + credentials. Microsoft 365 does not. |
 | **CalDAV/CardDAV** (Nextcloud, Fastmail, your own server) | Server URL(s) + username/password (app password if applicable) |
 
 ### Connecting Google (one click)
@@ -138,6 +139,61 @@ To update: `docker compose pull && docker compose up -d`.
 you put in Public base URL, the redirect completes automatically and you can skip
 the copy-paste.) The token is refreshed automatically afterwards — one-time step.
 
+### Microsoft 365 contacts (Graph)
+
+One-way contact sync from CardDAV (typically iCloud) into the signed-in user's
+own Outlook contacts. Calendars via Graph are not supported. The **Microsoft
+(CalDAV)** account type is unchanged.
+
+CaCs depends on [`vdirsyncer-graph`](https://github.com/mzilinski/vdirsyncer-graph)
+**0.1.0** (LGPL-2.0-or-later). The package is installed in the image; its
+sources are not copied into this repository.
+
+**Entra app registration** (once):
+
+1. Microsoft Entra → App registrations → New registration. Personal and work
+   accounts (`common`) is fine.
+2. Authentication → Add a platform → Mobile and desktop applications. Redirect
+   URI `http://localhost:53682/callback`. Set **Allow public client flows** to
+   Yes.
+3. API permissions → Microsoft Graph → Delegated: `User.Read`,
+   `Contacts.ReadWrite`, `offline_access`. Grant admin consent if the tenant
+   requires it. The upstream plugin also requests `Calendars.ReadWrite` and
+   `Tasks.ReadWrite`. CaCs narrows the requested scopes to the three above, so
+   those extra permissions are not required.
+4. Copy the **Application (client) ID**. There is no client secret.
+
+In CaCs: add a **Microsoft 365** account, paste the client ID, leave tenant as
+`common` (or your tenant id / `organizations` / `consumers`), save, then
+**Connect Microsoft 365**. Open <https://microsoft.com/devicelogin> and enter
+the code shown in the dialog. The refresh token is stored under `/data` and
+refreshed on later syncs. If Microsoft revokes it, or it sits unused for about
+90 days, the sync stops with a reconnect message — open the account and
+connect again. Sync does not wait on an interactive login.
+
+**Create a new empty contact folder in Outlook and map only that folder.**
+A one-way sync makes the Outlook folder a mirror of iCloud. The first sync
+**deletes Outlook contacts in that folder whose UID is not in iCloud.** Back
+up first if the folder already has contacts. With iCloud on side A and
+direction A → B, iCloud is not modified.
+
+New pairs that include a Microsoft 365 account default to contacts, iCloud on
+A, and A → B. Switching a mapping to two-way asks for confirmation: two-way
+writes Microsoft's normalized contact back to the other side.
+
+**What Outlook does not keep** (iCloud still has the original):
+
+- Birthday is read from Graph and never written back. Writing it would create
+  a recurring event on the Birthdays calendar.
+- URLs, related people, anniversaries, and Apple-only fields (`X-APPLE-*`, labels).
+- Addresses with no street, and addresses beyond one home and one work.
+- Extra mobile numbers. A number tagged only as iPhone (not Cell) is stored as
+  a work number. Graph allows at most two work numbers and two home numbers.
+- Photos that are not inline in the vCard. A vCard with no photo does not
+  delete a photo already on Outlook.
+
+Only `/me`. No shared mailboxes and no directory (GAL).
+
 ## Interface
 
 | Page | Content |
@@ -152,6 +208,9 @@ the copy-paste.) The token is refreshed automatically afterwards — one-time st
 
 - **No true real-time** — iCloud CalDAV offers no push. CaCs polls on an
   interval (default 300 s, down to 30 s) and transfers only deltas via sync token.
+- **Microsoft 365 contacts:** map an empty Outlook folder. The first one-way sync
+  deletes contacts in that folder that are not in the source. Fields Outlook
+  does not keep are listed under "Microsoft 365 contacts (Graph)" above.
 - **Initial sync / duplicates:** vdirsyncer matches by UID, so duplicates only
   happen when the *same* event has *different* UIDs on each side. If you do get
   duplicates, the reliable fix is to set the pair to **one-way (A→B)**, use
@@ -197,9 +256,9 @@ Set these in the `environment:` block of your compose file (all optional):
 
 ```
 ┌────────────────────────── cacs (1 container) ───────────────────────────┐
-│  FastAPI ──scheduler──▶ vdirsyncer (subprocess) ──CalDAV/CardDAV/API──▶  │
+│  FastAPI ──scheduler──▶ vdirsyncer (subprocess) ──CalDAV/CardDAV/Graph─▶ │
 │   │  │                       │ stdout/stderr        iCloud · Google ·     │
-│   │  └─ web UI :8080         ▼                       Microsoft · DAV …    │
+│   │  └─ web UI :8080         ▼                       M365 contacts · DAV   │
 │   └─ SQLite (runs/activity) ◀─ log parser ─ generated vdirsyncer.conf     │
 └───────────────────────────────────────────────────────────────────────────┘
    /config  generated conf      /data  DB · config · OAuth tokens · status     /logs

@@ -14,6 +14,8 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import confgen
+import graphauth
+import graphsetup
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, PlainTextResponse,
@@ -35,6 +37,9 @@ GOOGLE_SCOPES = ("https://www.googleapis.com/auth/calendar "
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("cacs")
+# Subprocess registration is sitecustomize; this covers in-process storages
+# when sitecustomize did not run (local dev, tests).
+graphsetup.try_install()
 
 DATA_DIR = os.environ.get("CACS_DATA", os.environ.get("CALSYNC_DATA", "/data"))
 DB_PATH = os.path.join(DATA_DIR, "cacs.db")
@@ -352,6 +357,78 @@ async def google_finish(request: Request, _: str = Depends(require_api)):
     return {"ok": True}
 
 
+# --- Microsoft Graph device-code (contacts only) ---------------------------
+# device_code stays in memory. It is a secret and dies with the process.
+_graph_devices: dict[str, dict[str, Any]] = {}
+
+
+def _graph_account(acc_id: str) -> dict[str, Any]:
+    acc = store.account(acc_id)
+    if not acc or acc.get("kind") != "graph":
+        raise HTTPException(400, "Unknown Microsoft 365 account")
+    if not acc.get("client_id"):
+        raise HTTPException(400, "Set the Application (client) ID first.")
+    return acc
+
+
+@app.post("/api/graph/device/start")
+async def graph_device_start(request: Request, _: str = Depends(require_api)):
+    """Begin device-code sign-in. The UI shows user_code; the device_code stays here."""
+    body = await request.json()
+    acc_id = body.get("account")
+    acc = _graph_account(acc_id)
+    try:
+        tenant = graphauth.normalize_tenant(acc.get("tenant"))
+        started = graphauth.request_device_code(tenant, acc["client_id"])
+    except graphauth.GraphAuthError as exc:
+        raise HTTPException(400, str(exc))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    _graph_devices[acc_id] = {
+        "device_code": started["device_code"],
+        "tenant": tenant,
+        "client_id": acc["client_id"],
+        "interval": started["interval"],
+        "expires_at": time.time() + started["expires_in"],
+    }
+    return {
+        "user_code": started["user_code"],
+        "verification_uri": started["verification_uri"],
+        "message": started["message"],
+        "interval": started["interval"],
+        "expires_in": started["expires_in"],
+    }
+
+
+@app.post("/api/graph/device/poll")
+async def graph_device_poll(request: Request, _: str = Depends(require_api)):
+    """One poll. Pending until Microsoft returns a refresh token."""
+    body = await request.json()
+    acc_id = body.get("account")
+    _graph_account(acc_id)
+    session = _graph_devices.get(acc_id)
+    if not session:
+        raise HTTPException(400, "Start the device-code sign-in again.")
+    if session["expires_at"] < time.time():
+        _graph_devices.pop(acc_id, None)
+        raise HTTPException(400, "That device code expired. Start the sign-in again.")
+    try:
+        result = graphauth.poll_device_code(
+            session["tenant"], session["client_id"], session["device_code"])
+    except graphauth.GraphAuthError as exc:
+        _graph_devices.pop(acc_id, None)
+        raise HTTPException(400, str(exc))
+    if result.get("pending"):
+        return {"pending": True}
+    graphauth.write_token(acc_id, result["token"])
+    _graph_devices.pop(acc_id, None)
+    accounts = store.get()["accounts"]
+    accounts[acc_id]["graph_connected"] = True
+    store.replace("accounts", accounts)
+    log.info("Microsoft 365 account %s connected", acc_id)
+    return {"connected": True}
+
+
 # --- HTML pages ------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 def dashboard(request: Request, _: str = Depends(require_page)):
@@ -468,8 +545,22 @@ async def api_save_account(request: Request, _: str = Depends(require_api)):
     accounts = store.get()["accounts"]
     acc_id = body.get("id") or secrets.token_hex(4)
     acc = accounts.get(acc_id, {})
+    prev_client_id = acc.get("client_id")
     acc.setdefault("kind", body.get("kind", "caldav"))
     _apply_secrets(acc, {k: v for k, v in body.items() if k != "id"})
+    if acc.get("kind") == "graph":
+        try:
+            acc["tenant"] = graphauth.normalize_tenant(acc.get("tenant"))
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if acc.get("client_id") != prev_client_id:
+            # The token file is what discover/sync check. A new client id
+            # cannot reuse it, so drop it and require a fresh device code.
+            acc["graph_connected"] = False
+            try:
+                os.remove(graphauth.token_path(acc_id))
+            except OSError:
+                pass
     accounts[acc_id] = acc
     store.replace("accounts", accounts)
     return {"ok": True, "id": acc_id, "config": store.public_view()}
@@ -485,6 +576,11 @@ def api_del_account(acc_id: str, _: str = Depends(require_api)):
     accounts = cfg["accounts"]
     accounts.pop(acc_id, None)
     store.replace("accounts", accounts)
+    for suffix in ("cal", "card"):
+        try:
+            os.remove(os.path.join(confgen.TOKEN_DIR, f"acc_{acc_id}_{suffix}.token"))
+        except OSError:
+            pass
     return {"ok": True, "config": store.public_view()}
 
 
@@ -498,6 +594,11 @@ async def api_save_pair(request: Request, _: str = Depends(require_api)):
         raise HTTPException(400, "Unknown account")
     if a == b:
         raise HTTPException(400, "A and B must be different")
+    service = body.get("service", "calendar")
+    graph_sides = [aid for aid in (a, b) if cfg["accounts"][aid].get("kind") == "graph"]
+    if graph_sides and service != "contacts":
+        raise HTTPException(
+            400, "Microsoft 365 Graph accounts only sync contacts, not calendars.")
     direction = body.get("direction", "both")
     if direction not in ("both", "a_to_b", "b_to_a"):
         raise HTTPException(400, "Invalid direction")
@@ -517,7 +618,7 @@ async def api_save_pair(request: Request, _: str = Depends(require_api)):
         collections.append([c[0], c[1], c[2], c_dir, c_conf])
     pairs[pid] = {
         "name": body.get("name") or pid,
-        "service": body.get("service", "calendar"),
+        "service": service,
         "a": a, "b": b,
         "direction": direction,                 # default for new mappings / fallback
         "conflict_resolution": default_conflict,

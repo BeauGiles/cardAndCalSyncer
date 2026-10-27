@@ -59,6 +59,12 @@ async def probe_target(store, pair_id: str, collection: str) -> dict[str, Any]:
     if svc != "contacts":
         return {"error": "probe currently only diagnoses contact (CardDAV) targets"}
     accs = cfg["accounts"]
+    if any(accs.get(pair.get(k), {}).get("kind") == "graph" for k in ("a", "b")):
+        return {"error": (
+            "Diagnose's create-probe is for Google CardDAV. "
+            "For Microsoft 365, read the sync log. Deleted Outlook contacts do not "
+            "linger in a trash that blocks the same UID the way Google Contacts does."
+        )}
 
     # target = the Google side (where creates are rejected); source = the other
     tkey = next((k for k in ("a", "b")

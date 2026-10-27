@@ -16,6 +16,7 @@ from typing import Any
 import aiohttp
 
 import enrich
+import graphauth
 from store import vpair_name
 
 log = logging.getLogger("cacs.clear")
@@ -73,6 +74,13 @@ async def run_clear(store, pair_id: str, side: str, months: int,
         if not os.path.exists(os.path.join(enrich.TOKEN_DIR, f"acc_{acc_id}_{suf}.token")):
             raise ValueError("Connect Google first")
         os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+    if acc.get("kind") == "graph":
+        if not os.path.exists(graphauth.token_path(acc_id)):
+            raise ValueError(
+                "Not connected to Microsoft 365. Open the account and click "
+                "'Connect Microsoft 365'. If it was connected before, reconnect "
+                "with a new device code."
+            )
 
     # the "newer than N months" window only makes sense for calendars (vCards
     # have no date) — ignore it for contacts and clear everything.
