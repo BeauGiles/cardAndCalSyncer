@@ -13,6 +13,7 @@ from store import storage_name, vpair_name
 
 STATUS_PATH = "/data/status/"
 TOKEN_DIR = "/data"
+GRAPH_CACHE_DIR = "/data/graph-cache"  # delta state + UID map: must survive restarts
 
 ICLOUD_CAL_URL = "https://caldav.icloud.com/"
 ICLOUD_CARD_URL = "https://contacts.icloud.com/"
@@ -20,6 +21,11 @@ ICLOUD_CARD_URL = "https://contacts.icloud.com/"
 
 def _val(v: Any) -> str:
     return json.dumps(v)
+
+
+def graph_token_path(account_id: str) -> str:
+    """One Microsoft token file per account, shared by its calendar/contacts storages."""
+    return f"{TOKEN_DIR}/acc_{account_id}_graph.json"
 
 
 def _sec_var(account_id: str, field: str) -> str:
@@ -43,6 +49,15 @@ def _storage_block(account_id: str, acc: dict[str, Any], service: str,
             var = _sec_var(account_id, fld)
             env[var] = acc.get(fld, "") or ""
             out.append(f'{fld}.fetch = ["command", "printenv", "{var}"]')
+    elif kind == "graph":
+        out.append(f'type = {_val("graph_calendar" if is_cal else "graph_contacts")}')
+        out.append(f'token_file = {_val(graph_token_path(account_id))}')
+        out.append(f'cache_dir = {_val(f"{GRAPH_CACHE_DIR}/{account_id}")}')
+        out.append(f'tenant = {_val(acc.get("tenant") or "common")}')
+        out.append('auth_flow = "device"')
+        var = _sec_var(account_id, "client_id")
+        env[var] = acc.get("client_id", "") or ""
+        out.append(f'client_id.fetch = ["command", "printenv", "{var}"]')
     else:
         out.append(f'type = {_val("caldav" if is_cal else "carddav")}')
         if kind == "icloud":
@@ -152,4 +167,12 @@ def generate(cfg: dict[str, Any], *, only_pair: str | None = None,
             "",
         ]
 
+    return "\n".join(lines) + "\n", env
+
+
+def graph_login_conf(account_id: str, acc: dict[str, Any]) -> tuple[str, dict[str, str]]:
+    """Minimal config holding only this account's Graph storage, for `graph-login`."""
+    env: dict[str, str] = {}
+    lines = ["[general]", f'status_path = {_val(STATUS_PATH)}', ""]
+    lines += _storage_block(account_id, acc, "contacts", env)
     return "\n".join(lines) + "\n", env

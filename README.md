@@ -97,8 +97,24 @@ To update: `docker compose pull && docker compose up -d`.
 |---|---|
 | **iCloud** | Apple ID + **app-specific password** (appleid.apple.com → Sign-In & Security; 2FA required) |
 | **Google** | OAuth client of type **"Web application"** from the Google Cloud Console; paste Client ID + secret, then click **"Connect Google"** — one browser consent, no CLI (see below) |
-| **Microsoft/Outlook** | Only if the account allows CalDAV/CardDAV — server URL + credentials. **Microsoft 365 / Graph is not supported** (vdirsyncer doesn't speak Graph) |
+| **Microsoft 365** (fork) | Azure app registration + **Connect Microsoft** (device-code sign-in, see below). Uses [vdirsyncer-graph](https://github.com/mzilinski/vdirsyncer-graph); contacts are the tested path |
+| **Microsoft/Outlook (CalDAV)** | Only if the account allows CalDAV/CardDAV — server URL + credentials |
 | **CalDAV/CardDAV** (Nextcloud, Fastmail, your own server) | Server URL(s) + username/password (app password if applicable) |
+
+### Connecting Microsoft 365 (Graph)
+
+1. In the [Azure portal](https://portal.azure.com) → *App registrations* → *New registration*
+   (account types: whatever fits; personal + work is fine).
+2. *Authentication* → set **Allow public client flows: Yes**. No client secret is needed.
+3. *API permissions* → Microsoft Graph → delegated: `User.Read`, `Contacts.ReadWrite`,
+   `Calendars.ReadWrite`, `Tasks.ReadWrite`, `offline_access` (the library requests all of
+   them, so add all even if you only sync contacts). Work/school tenants may need admin consent.
+4. In CaCs: add a **Microsoft 365** account, paste the **Application (client) ID**
+   (tenant `common` unless your org needs a specific one), save, reopen, click
+   **Connect Microsoft**, and enter the shown code at the shown Microsoft URL.
+
+Notes: the token and the delta/UID cache live under `/data` (keep it on a volume). *Clear* and
+*Fix UIDs* are not available for Microsoft accounts. Contact `birthday` is never written back.
 
 ### Connecting Google (one click)
 

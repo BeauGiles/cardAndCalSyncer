@@ -23,7 +23,7 @@ from fastapi.templating import Jinja2Templates
 
 from auth import COOKIE_NAME, REMEMBER_AGE, Auth
 from db import Database
-from runner import ROLLING_LOG, Runner
+from runner import ROLLING_LOG, VDIRSYNCER, Runner
 from store import ConfigStore
 
 APP_NAME = "CaCs"
@@ -350,6 +350,90 @@ async def google_finish(request: Request, _: str = Depends(require_api)):
     except Exception as exc:
         raise HTTPException(502, f"Token exchange failed: {exc}")
     return {"ok": True}
+
+
+# --- Microsoft Graph login (device code) -----------------------------------
+# `vdirsyncer-graph graph-login` prints "open <url> and enter the code <code>"
+# and then polls until the user approves; we relay that text to the UI.
+_graph_logins: dict[str, dict[str, Any]] = {}
+GRAPH_LOGIN_TIMEOUT = 15 * 60  # device codes expire after ~15 min
+
+
+async def _run_graph_login(acc_id: str, state: dict[str, Any]) -> None:
+    acc = store.account(acc_id) or {}
+    conf, env = confgen.graph_login_conf(acc_id, acc)
+    path = f"/config/.graph-login-{acc_id}.conf"
+    os.makedirs("/config", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(conf)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            VDIRSYNCER, "graph-login", "-c", path, "--flow", "device",
+            env={**os.environ, **env}, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT)
+
+        async def _read() -> None:
+            assert proc.stdout
+            async for raw in proc.stdout:
+                line = raw.decode("utf-8", "replace").rstrip()
+                state["lines"].append(line[:500])
+                if "devicelogin" in line or "enter the code" in line.lower():
+                    state["message"] = line[:500]
+
+        try:
+            await asyncio.wait_for(_read(), timeout=GRAPH_LOGIN_TIMEOUT)
+            rc = await proc.wait()
+        except asyncio.TimeoutError:
+            proc.kill()
+            rc = -1
+            state["lines"].append("Login timed out — start again.")
+        if rc == 0 and os.path.exists(confgen.graph_token_path(acc_id)):
+            accounts = store.get()["accounts"]
+            if acc_id in accounts:
+                accounts[acc_id]["graph_connected"] = True
+                store.replace("accounts", accounts)
+            state["state"] = "connected"
+            log.info("Microsoft account %s connected", acc_id)
+        else:
+            state["state"] = "error"
+    except Exception as exc:
+        log.exception("Graph login failed")
+        state["lines"].append(str(exc))
+        state["state"] = "error"
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+@app.post("/api/graph/login")
+async def graph_login_start(request: Request, _: str = Depends(require_api)):
+    body = await request.json()
+    acc_id = body.get("account")
+    acc = store.account(acc_id) if acc_id else None
+    if not acc or acc.get("kind") != "graph":
+        raise HTTPException(400, "Unknown Microsoft account")
+    if not acc.get("client_id"):
+        raise HTTPException(400, "Set the Application (client) ID first")
+    cur = _graph_logins.get(acc_id)
+    if cur and cur["state"] == "running":
+        return {"state": "running", "message": cur["message"]}
+    state: dict[str, Any] = {"state": "running", "message": "", "lines": []}
+    _graph_logins[acc_id] = state
+    _spawn(_run_graph_login(acc_id, state))
+    return {"state": "running", "message": ""}
+
+
+@app.get("/api/graph/login")
+def graph_login_status(account: str, _: str = Depends(require_api)):
+    st = _graph_logins.get(account)
+    if not st:
+        return {"state": "idle", "message": ""}
+    out = {"state": st["state"], "message": st["message"]}
+    if st["state"] == "error":
+        out["detail"] = "\n".join(st["lines"][-5:])
+    return out
 
 
 # --- HTML pages ------------------------------------------------------------

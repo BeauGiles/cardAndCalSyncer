@@ -68,6 +68,8 @@ async def run_clear(store, pair_id: str, side: str, months: int,
     deltas = enrich._collection_deltas(pair_id)
     if not deltas:
         raise ValueError("Run 'Load collections' first (no discovery cache)")
+    if acc.get("kind") == "graph":
+        raise ValueError("Not supported for Microsoft 365 accounts")
     if acc.get("kind") == "google":
         suf = "cal" if svc == "calendar" else "card"
         if not os.path.exists(os.path.join(enrich.TOKEN_DIR, f"acc_{acc_id}_{suf}.token")):

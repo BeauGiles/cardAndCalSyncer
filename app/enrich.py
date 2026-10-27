@@ -104,6 +104,8 @@ def build_collection_config(account_id: str, acc: dict[str, Any], service: str,
     """
     is_cal = service == "calendar"
     kind = acc.get("kind", "caldav")
+    if kind == "graph":
+        return None  # Graph storages aren't reconstructable here; titles come from the other side
     if kind == "google":
         base = {
             "type": "google_calendar" if is_cal else "google_contacts",

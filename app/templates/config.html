@@ -33,6 +33,7 @@
     <span class="muted">New account:</span>
     <button class="btn" onclick="addAccount('icloud')">+ iCloud</button>
     <button class="btn" onclick="addAccount('google')">+ Google</button>
+    <button class="btn" onclick="addAccount('graph')">+ Microsoft 365</button>
     <button class="btn" onclick="addAccount('microsoft')">+ Microsoft/Outlook</button>
     <button class="btn" onclick="addAccount('nextcloud')">+ Nextcloud</button>
     <button class="btn" onclick="addAccount('fastmail')">+ Fastmail</button>
@@ -56,9 +57,12 @@ const PRESETS = {
               help:'App-specific password from appleid.apple.com (not your normal password).'},
   google:    {kind:'google', label:'Google', fields:['client_id','client_secret'],
               help:'Enable the CalDAV API (and CardDAV API for contacts) in your Google Cloud project, create an OAuth client of type "Web application", then Save and click "Connect Google" below.'},
-  microsoft: {kind:'caldav', label:'Microsoft/Outlook', fields:['username','password','cal_url','card_url'],
+  graph:     {kind:'graph', label:'Microsoft 365', fields:['client_id','tenant'],
+              tenant:'common',
+              help:'Microsoft 365 / Outlook.com via Microsoft Graph (contacts; calendars untested). Register a free app in the Azure portal (public client, "Allow public client flows" = Yes) with delegated permissions User.Read, Calendars.ReadWrite, Contacts.ReadWrite, Tasks.ReadWrite and offline_access, paste its Application (client) ID, Save, reopen and click "Connect Microsoft".'},
+  microsoft: {kind:'caldav', label:'Microsoft/Outlook (CalDAV)', fields:['username','password','cal_url','card_url'],
               cal_url:'https://outlook.office365.com/', card_url:'',
-              help:'⚠️ Works only if the account allows CalDAV/CardDAV. Microsoft 365/Graph is NOT supported by vdirsyncer.'},
+              help:'Only works if the account allows CalDAV/CardDAV. For Microsoft 365 use the "Microsoft 365" (Graph) account type instead.'},
   nextcloud: {kind:'caldav', label:'Nextcloud', fields:['username','password','cal_url','card_url'],
               cal_url:'https://cloud.example.com/remote.php/dav/', card_url:'https://cloud.example.com/remote.php/dav/',
               help:'URL of your Nextcloud DAV endpoints.'},
@@ -69,7 +73,8 @@ const PRESETS = {
               help:'Any server. Enter the calendar URL and/or the contacts URL.'},
 };
 const FIELD_LABEL = {username:'Username / email', password:'Password', cal_url:'Calendar URL (CalDAV)',
-  card_url:'Contacts URL (CardDAV)', client_id:'Client ID', client_secret:'Client secret'};
+  card_url:'Contacts URL (CardDAV)', client_id:'Client ID', client_secret:'Client secret',
+  tenant:'Tenant (common, organizations, consumers or a tenant ID)'};
 
 function $(id){return document.getElementById(id);}
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -114,7 +119,7 @@ async function testAlert(){
 }
 
 // --- ACCOUNTS ---
-function presetForKind(kind){ return kind==='icloud'?PRESETS.icloud : kind==='google'?PRESETS.google : PRESETS.caldav; }
+function presetForKind(kind){ return kind==='icloud'?PRESETS.icloud : kind==='google'?PRESETS.google : kind==='graph'?PRESETS.graph : PRESETS.caldav; }
 
 function renderAccounts(){
   const root=$('accounts'); root.innerHTML='';
@@ -173,12 +178,24 @@ function accountForm(id, presetKey){
     }
   }
 
+  // Microsoft Graph: device-code login (no redirect URI needed)
+  let mblock = '';
+  if(kind==='graph'){
+    mblock = id ? `<div class="connect">
+        <div class="row gap">
+          <button class="btn primary" id="acc-gconnect">Connect Microsoft</button>
+          <span class="${a.graph_connected?'side google':'muted'}" id="gstate">${a.graph_connected?'✓ connected':'not connected'}</span>
+        </div>
+        <p class="hint hidden" id="gmsg"></p></div>`
+      : `<p class="hint">Save this account first, then reopen it to connect Microsoft.</p>`;
+  }
+
   const dlg=document.createElement('div'); dlg.className='overlay';
   dlg.innerHTML=`<div class="dialog"><h2>${id?'Edit account':'Add '+preset.label}</h2>
     <p class="hint">${esc(preset.help||'')}</p>
     <label>Display name<input id="acc-name" value="${esc(a.name||preset.label)}"></label>
     <div class="grid2">${fields}</div>
-    ${gblock}
+    ${gblock}${mblock}
     <div class="row gap" style="margin-top:12px">
       <button class="btn primary" id="acc-save">Save</button>
       <button class="btn" id="acc-cancel">Cancel</button>
@@ -215,6 +232,30 @@ function accountForm(id, presetKey){
       if(w) w.location=url; else window.open(url,'_blank');
       dlg.querySelector('#paste-wrap').classList.remove('hidden');
     }catch(e){ if(w) w.close(); dlg.querySelector('#acc-msg').textContent=e.message; }
+  };
+  const gconnect=dlg.querySelector('#acc-gconnect');
+  if(gconnect) gconnect.onclick=async()=>{
+    const msg=dlg.querySelector('#gmsg');
+    try{
+      const savedId=await save();
+      await api('/api/graph/login',{method:'POST',body:JSON.stringify({account:savedId})});
+      msg.classList.remove('hidden'); msg.textContent='Starting sign-in…';
+      gconnect.disabled=true;
+      const poll=async()=>{
+        if(!document.body.contains(dlg)) return;   // dialog closed
+        const r=await api('/api/graph/login?account='+encodeURIComponent(savedId));
+        if(r.state==='connected'){
+          CFG=await api('/api/config'); dlg.remove(); renderAccounts(); renderPairs();
+          toast('Microsoft connected ✓'); return;
+        }
+        if(r.state==='error'){
+          msg.textContent='Sign-in failed. '+(r.detail||''); gconnect.disabled=false; return;
+        }
+        if(r.message) msg.textContent=r.message;
+        setTimeout(poll,2000);
+      };
+      poll();
+    }catch(e){ dlg.querySelector('#acc-msg').textContent=e.message; gconnect.disabled=false; }
   };
   const finishBtn=dlg.querySelector('#acc-finish');
   if(finishBtn) finishBtn.onclick=async()=>{

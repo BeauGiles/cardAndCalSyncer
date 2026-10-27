@@ -21,6 +21,9 @@ from store import ConfigStore, vpair_name
 
 log = logging.getLogger("cacs.runner")
 
+# vdirsyncer's own CLI plus the Microsoft Graph storages (graph_calendar /
+# graph_contacts) registered; otherwise identical to plain `vdirsyncer`.
+VDIRSYNCER = "vdirsyncer-graph"
 CONFIG_FILE = "/config/vdirsyncer.conf"
 DISCOVER_CONF = "/config/.discover.conf"
 ROLLING_LOG = "/logs/vdirsyncer.log"
@@ -190,7 +193,7 @@ class Runner:
             pass
 
     def _unconnected_google(self, cfg: dict[str, Any], pair: str) -> list[str]:
-        """Names of Google accounts in this pair that have no OAuth token yet."""
+        """Names of Google/Microsoft accounts in this pair that have no OAuth token yet."""
         p = cfg["pairs"][pair]
         accs = cfg["accounts"]
         svc = "cal" if p.get("service", "calendar") == "calendar" else "card"
@@ -200,6 +203,9 @@ class Runner:
             if a.get("kind") == "google":
                 tok = os.path.join(confgen.TOKEN_DIR, f"acc_{aid}_{svc}.token")
                 if not os.path.exists(tok):
+                    missing.append(a.get("name", aid))
+            elif a.get("kind") == "graph":
+                if not os.path.exists(confgen.graph_token_path(aid)):
                     missing.append(a.get("name", aid))
         return missing
 
@@ -298,7 +304,7 @@ class Runner:
         conf, secret_env = confgen.generate(cfg, only_pair=pair, only_collection=collection)
         self._write_conf(CONFIG_FILE, conf)
 
-        cmd = ["vdirsyncer", "-v", "INFO", "-c", CONFIG_FILE, "sync", vpair]
+        cmd = [VDIRSYNCER, "-v", "INFO", "-c", CONFIG_FILE, "sync", vpair]
         rc, lines = await self._exec(cmd, secret_env, run_id)
 
         # First sync of this mapping (no cache) or after a direction change:
@@ -307,7 +313,7 @@ class Runner:
         # for this scoped config, then retry. (Uses this mapping's own pair name,
         # so it never clobbers the shared `<pid>.collections` register cache.)
         if rc != 0 and any("vdirsyncer discover" in l for l in lines):
-            await self._exec(["vdirsyncer", "-v", "INFO", "-c", CONFIG_FILE,
+            await self._exec([VDIRSYNCER, "-v", "INFO", "-c", CONFIG_FILE,
                               "discover", vpair], secret_env, run_id)
             rc, lines = await self._exec(cmd, secret_env, run_id)
 
@@ -330,7 +336,7 @@ class Runner:
         # redacted) to capture it — but only for GENUINE failures. A non-zero exit
         # caused purely by skipped items (per-item 412/404) needs no traceback.
         if parsed.errors or (rc != 0 and not parsed.skipped):
-            dbg = ["vdirsyncer", "-v", "DEBUG", "-c", CONFIG_FILE, "sync", vpair]
+            dbg = [VDIRSYNCER, "-v", "DEBUG", "-c", CONFIG_FILE, "sync", vpair]
             _, dlines = await self._exec(dbg, secret_env, run_id)
             lines = lines + ["", "----- DEBUG retry (redacted) -----"] + dlines
 
@@ -457,9 +463,9 @@ class Runner:
                                                      only_collection=collection)
                 self._write_conf(CONFIG_FILE, conf)
                 clear_mod._reset_sync_status(pair, collection)   # force a create attempt
-                await self._exec(["vdirsyncer", "-v", "INFO", "-c", CONFIG_FILE,
+                await self._exec([VDIRSYNCER, "-v", "INFO", "-c", CONFIG_FILE,
                                   "discover", vpair], secret_env, run_id)
-                rc, lines = await self._exec(["vdirsyncer", "-v", "DEBUG", "-c",
+                rc, lines = await self._exec([VDIRSYNCER, "-v", "DEBUG", "-c",
                                               CONFIG_FILE, "sync", vpair], secret_env, run_id)
                 block, reason = _first_failure_block(lines)
                 self.db.finish_run(run_id, status="success", finished_at=_now(), rc=rc,
@@ -621,12 +627,13 @@ class Runner:
             return {"account": aid, "name": accs.get(aid, {}).get("name", aid),
                     "collections": colls or []}
 
-        # Fail fast (and clearly) if a Google account isn't connected yet —
-        # otherwise vdirsyncer would try its own browser OAuth flow and hang.
+        # Fail fast (and clearly) if a Google/Microsoft account isn't connected
+        # yet — otherwise vdirsyncer would start its own interactive OAuth flow
+        # and hang.
         missing = self._unconnected_google(cfg, pair)
         if missing:
-            msg = ("Not connected to Google: " + ", ".join(missing) +
-                   ". Open the account and click 'Connect Google' first.")
+            msg = ("Not connected: " + ", ".join(missing) +
+                   ". Open the account and click 'Connect' first.")
             self.db.finish_run(run_id, status="failed", finished_at=_now(), rc=-1,
                                n_create=0, n_update=0, n_delete=0, n_errors=1, log=msg)
             return {"run_id": run_id, "status": "failed", "rc": -1, "error": msg,
@@ -635,7 +642,7 @@ class Runner:
         conf, secret_env = confgen.generate(cfg, only_pair=pair, list_all=list_all)
         self._write_conf(DISCOVER_CONF, conf)
 
-        cmd = ["vdirsyncer", "-v", "INFO", "-c", DISCOVER_CONF, "discover"]
+        cmd = [VDIRSYNCER, "-v", "INFO", "-c", DISCOVER_CONF, "discover"]
         if list_all:
             cmd.append("--list")
         cmd.append(pair)
@@ -650,7 +657,7 @@ class Runner:
         # If a side failed to discover, retry once at DEBUG (secrets redacted)
         # to capture the real traceback for the details panel.
         if list_all and (not discovered.get(sa) or not discovered.get(sb)):
-            dbg = ["vdirsyncer", "-v", "DEBUG", "-c", DISCOVER_CONF, "discover", "--list", pair]
+            dbg = [VDIRSYNCER, "-v", "DEBUG", "-c", DISCOVER_CONF, "discover", "--list", pair]
             _, dlines = await self._exec(dbg, secret_env, run_id)
             log_tail = "\n".join(dlines[-80:])
             if not diag.errors:
