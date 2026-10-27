@@ -1,7 +1,7 @@
 """Configuration store: the web UI is the source of truth.
 
 Model:
-  accounts[<id>]  = { name, kind, ... }        # kind: icloud | google | caldav
+  accounts[<id>]  = { name, kind, ... }        # kind: icloud | google | caldav | graph
   pairs[<id>]     = { name, service, a, b, conflict_resolution, collections }
   auth            = { username, pw_salt, pw_hash, secret }
   alerts          = { apprise_urls, on_failure, on_recovery }
@@ -19,7 +19,12 @@ from copy import deepcopy
 from typing import Any
 
 # kind -> human-friendly default label (UI presets provide the rest)
-KIND_LABEL = {"icloud": "iCloud", "google": "Google", "caldav": "CalDAV/CardDAV"}
+KIND_LABEL = {
+    "icloud": "iCloud",
+    "google": "Google",
+    "caldav": "CalDAV/CardDAV",
+    "graph": "Microsoft 365",
+}
 
 # fields treated as secrets (never written to vdirsyncer.conf, only via env)
 SECRET_FIELDS = {"password", "client_secret", "client_id"}

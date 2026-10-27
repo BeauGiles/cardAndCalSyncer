@@ -108,7 +108,7 @@ textarea{width:100%;resize:vertical}
 /* dynamische Items (Accounts/Paare) */
 .item{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:14px;margin:10px 0}
 .side.caldav{background:rgba(139,150,165,.18);color:#aeb8c4}
-.side.microsoft{background:rgba(0,120,212,.18);color:#3b9bff}
+.side.microsoft,.side.graph{background:rgba(0,120,212,.18);color:#3b9bff}
 
 /* Dialog-Overlay */
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;

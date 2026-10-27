@@ -15,11 +15,16 @@ import confgen
 import diagnose as diag_mod
 import enrich
 import fixuids
+import graphauth
+import graphsetup
 import parser
 from db import Database
 from store import ConfigStore, vpair_name
 
 log = logging.getLogger("cacs.runner")
+# In-process storages (clear, enrich, diagnose) need the plugin registered.
+# The vdirsyncer subprocess gets the same registration from sitecustomize.
+graphsetup.try_install()
 
 CONFIG_FILE = "/config/vdirsyncer.conf"
 DISCOVER_CONF = "/config/.discover.conf"
@@ -203,6 +208,41 @@ class Runner:
                     missing.append(a.get("name", aid))
         return missing
 
+    def _unconnected_graph(self, cfg: dict[str, Any], pair: str) -> list[str]:
+        """Names of Microsoft 365 accounts in this pair with no token file yet."""
+        p = cfg["pairs"][pair]
+        accs = cfg["accounts"]
+        missing = []
+        for aid in (p["a"], p["b"]):
+            a = accs.get(aid, {})
+            if a.get("kind") == "graph":
+                if not os.path.exists(graphauth.token_path(aid)):
+                    missing.append(a.get("name", aid))
+        return missing
+
+    @staticmethod
+    def _graph_reconnect_message(names: list[str]) -> str:
+        return (
+            "Not connected to Microsoft 365: " + ", ".join(names) +
+            ". Open the account and click 'Connect Microsoft 365'. "
+            "If it was connected before, the sign-in expired or was revoked — "
+            "reconnect with a new device code."
+        )
+
+    def _blocked_oauth(self, cfg: dict[str, Any], pair: str) -> str | None:
+        """Why this pair must not call vdirsyncer yet, or None if it may."""
+        parts: list[str] = []
+        missing_g = self._unconnected_google(cfg, pair)
+        if missing_g:
+            parts.append(
+                "Not connected to Google: " + ", ".join(missing_g) +
+                ". Open the account and click 'Connect Google' first."
+            )
+        missing_m = self._unconnected_graph(cfg, pair)
+        if missing_m:
+            parts.append(self._graph_reconnect_message(missing_m))
+        return " ".join(parts) or None
+
     def _write_conf(self, path: str, text: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
@@ -294,6 +334,15 @@ class Runner:
                        pair: str | None, collection: str | None = None) -> dict[str, Any]:
         # Each mapping syncs as its own vdirsyncer pair so read_only matches this
         # mapping's direction (per-mapping bisync/one-way).
+        if pair:
+            blocked = self._blocked_oauth(cfg, pair)
+            if blocked:
+                self.db.finish_run(
+                    run_id, status="failed", finished_at=_now(), rc=-1,
+                    n_create=0, n_update=0, n_delete=0, n_errors=1, log=blocked)
+                return {"run_id": run_id, "status": "failed", "rc": -1,
+                        "counts": {"create": 0, "update": 0, "delete": 0},
+                        "errors": [blocked], "warnings": []}
         vpair = vpair_name(pair, collection)
         conf, secret_env = confgen.generate(cfg, only_pair=pair, only_collection=collection)
         self._write_conf(CONFIG_FILE, conf)
@@ -621,15 +670,13 @@ class Runner:
             return {"account": aid, "name": accs.get(aid, {}).get("name", aid),
                     "collections": colls or []}
 
-        # Fail fast (and clearly) if a Google account isn't connected yet —
-        # otherwise vdirsyncer would try its own browser OAuth flow and hang.
-        missing = self._unconnected_google(cfg, pair)
-        if missing:
-            msg = ("Not connected to Google: " + ", ".join(missing) +
-                   ". Open the account and click 'Connect Google' first.")
+        # Fail fast if OAuth isn't done. Otherwise Google's browser flow or
+        # Graph's device-code login would run inside a non-interactive subprocess.
+        blocked = self._blocked_oauth(cfg, pair)
+        if blocked:
             self.db.finish_run(run_id, status="failed", finished_at=_now(), rc=-1,
-                               n_create=0, n_update=0, n_delete=0, n_errors=1, log=msg)
-            return {"run_id": run_id, "status": "failed", "rc": -1, "error": msg,
+                               n_create=0, n_update=0, n_delete=0, n_errors=1, log=blocked)
+            return {"run_id": run_id, "status": "failed", "rc": -1, "error": blocked,
                     "a": _side(p["a"]), "b": _side(p["b"])}
 
         conf, secret_env = confgen.generate(cfg, only_pair=pair, list_all=list_all)

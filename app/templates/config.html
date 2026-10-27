@@ -33,7 +33,8 @@
     <span class="muted">New account:</span>
     <button class="btn" onclick="addAccount('icloud')">+ iCloud</button>
     <button class="btn" onclick="addAccount('google')">+ Google</button>
-    <button class="btn" onclick="addAccount('microsoft')">+ Microsoft/Outlook</button>
+    <button class="btn" onclick="addAccount('microsoft')">+ Microsoft (CalDAV)</button>
+    <button class="btn" onclick="addAccount('graph')">+ Microsoft 365</button>
     <button class="btn" onclick="addAccount('nextcloud')">+ Nextcloud</button>
     <button class="btn" onclick="addAccount('fastmail')">+ Fastmail</button>
     <button class="btn" onclick="addAccount('caldav')">+ CalDAV/CardDAV</button>
@@ -56,9 +57,12 @@ const PRESETS = {
               help:'App-specific password from appleid.apple.com (not your normal password).'},
   google:    {kind:'google', label:'Google', fields:['client_id','client_secret'],
               help:'Enable the CalDAV API (and CardDAV API for contacts) in your Google Cloud project, create an OAuth client of type "Web application", then Save and click "Connect Google" below.'},
-  microsoft: {kind:'caldav', label:'Microsoft/Outlook', fields:['username','password','cal_url','card_url'],
+  microsoft: {kind:'caldav', label:'Microsoft/Outlook (CalDAV only)', fields:['username','password','cal_url','card_url'],
               cal_url:'https://outlook.office365.com/', card_url:'',
-              help:'⚠️ Works only if the account allows CalDAV/CardDAV. Microsoft 365/Graph is NOT supported by vdirsyncer.'},
+              help:'CalDAV/CardDAV only. Microsoft 365 does not expose CardDAV. For Outlook contacts, use Microsoft 365 (Graph) instead.'},
+  graph: {kind:'graph', label:'Microsoft 365 (Graph)', fields:['client_id','tenant'],
+          tenant:'common',
+          help:'Contacts only, one-way from iCloud into an empty Outlook contact folder. Entra public client: redirect http://localhost:53682/callback, allow public client flows, delegated User.Read, Contacts.ReadWrite and offline_access. Paste the Application (client) ID (no secret). Tenant is usually common. Save, then Connect Microsoft 365 and enter the device code at microsoft.com/devicelogin. The first sync deletes Outlook contacts in the mapped folder that are not in iCloud.'},
   nextcloud: {kind:'caldav', label:'Nextcloud', fields:['username','password','cal_url','card_url'],
               cal_url:'https://cloud.example.com/remote.php/dav/', card_url:'https://cloud.example.com/remote.php/dav/',
               help:'URL of your Nextcloud DAV endpoints.'},
@@ -69,7 +73,9 @@ const PRESETS = {
               help:'Any server. Enter the calendar URL and/or the contacts URL.'},
 };
 const FIELD_LABEL = {username:'Username / email', password:'Password', cal_url:'Calendar URL (CalDAV)',
-  card_url:'Contacts URL (CardDAV)', client_id:'Client ID', client_secret:'Client secret'};
+  card_url:'Contacts URL (CardDAV)', client_id:'Application (client) ID', client_secret:'Client secret',
+  tenant:'Tenant (common, organizations, consumers, or a tenant id)'};
+const KIND_LABEL = {icloud:'iCloud', google:'Google', graph:'Microsoft 365', caldav:'CalDAV'};
 
 function $(id){return document.getElementById(id);}
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
@@ -114,7 +120,23 @@ async function testAlert(){
 }
 
 // --- ACCOUNTS ---
-function presetForKind(kind){ return kind==='icloud'?PRESETS.icloud : kind==='google'?PRESETS.google : PRESETS.caldav; }
+function presetForKind(kind){
+  if(kind==='icloud') return PRESETS.icloud;
+  if(kind==='google') return PRESETS.google;
+  if(kind==='graph') return PRESETS.graph;
+  return PRESETS.caldav;
+}
+function pairHasGraph(pid){
+  const p=CFG.pairs[pid]||{};
+  return [p.a,p.b].some(id=>CFG.accounts[id]&&CFG.accounts[id].kind==='graph');
+}
+function suggestedDirection(pid){
+  const p=CFG.pairs[pid]||{};
+  const ka=(CFG.accounts[p.a]||{}).kind, kb=(CFG.accounts[p.b]||{}).kind;
+  if(kb==='graph' && ka!=='graph') return 'a_to_b';
+  if(ka==='graph' && kb!=='graph') return 'b_to_a';
+  return null;
+}
 
 function renderAccounts(){
   const root=$('accounts'); root.innerHTML='';
@@ -124,7 +146,7 @@ function renderAccounts(){
     const a=CFG.accounts[id];
     const div=document.createElement('div'); div.className='item';
     div.innerHTML=`<div class="row between"><div><b>${esc(a.name||id)}</b>
-      <span class="side ${a.kind}">${a.kind}</span></div>
+      <span class="side ${a.kind}">${KIND_LABEL[a.kind]||a.kind}</span></div>
       <div class="row gap"><button class="btn small" onclick="editAccount('${id}')">Edit</button>
       <button class="btn small danger" onclick="delAccount('${id}')">Delete</button></div></div>`;
     root.appendChild(div);
@@ -142,12 +164,14 @@ function accountForm(id, presetKey){
     const isSec = ['password','client_secret','client_id'].includes(f);
     const cur = a[f]||'';
     const ph = (cur==='__SET__') ? '•••••• (set)' : (preset[f]||'');
-    const val = (cur==='__SET__') ? '' : esc(cur);
+    const shown = cur || (f==='tenant' ? (preset.tenant||'common') : '');
+    const val = (cur==='__SET__') ? '' : esc(shown);
     return `<label>${FIELD_LABEL[f]||f}
       <input data-f="${f}" type="${isSec?'password':'text'}" value="${val}" placeholder="${esc(ph)}"></label>`;
   }).join('');
-  // Google-specific connect block
+  // Google / Microsoft 365 connect block
   let gblock = '';
+  let pollTimer = null;
   if(kind==='google'){
     const redir = ((CFG.base_url||location.origin).replace(/\/+$/,'')) + '/oauth/google/callback';
     if(id){
@@ -170,6 +194,25 @@ function accountForm(id, presetKey){
         Google rejects LAN IPs.</p></div>`;
     } else {
       gblock = `<p class="hint">Save this account first, then reopen it to connect Google.</p>`;
+    }
+  }
+  if(kind==='graph'){
+    if(id){
+      gblock = `<div class="connect">
+        <div class="row gap">
+          <button class="btn primary" id="graph-connect">Connect Microsoft 365</button>
+          <span class="${a.graph_connected?'side graph':'muted'}">${a.graph_connected?'✓ connected':'not connected'}</span>
+        </div>
+        <div id="graph-code" class="hidden" style="margin-top:10px">
+          <p class="hint">Open <a id="graph-link" href="https://microsoft.com/devicelogin" target="_blank" rel="noopener">microsoft.com/devicelogin</a>
+          and enter this code. This page waits until Microsoft approves it.</p>
+          <p><code id="graph-user-code" style="font-size:20px;letter-spacing:.08em"></code></p>
+          <p class="hint" id="graph-wait">waiting for approval…</p>
+        </div>
+        <p class="hint">Sign-in is a device code, so it works without a public redirect to this server.
+        If a later sync says the sign-in expired, click Connect again.</p></div>`;
+    } else {
+      gblock = `<p class="hint">Save this account first, then reopen it to connect Microsoft 365.</p>`;
     }
   }
 
@@ -201,7 +244,7 @@ function accountForm(id, presetKey){
     CFG=r.config; return r.id;
   }
 
-  dlg.querySelector('#acc-cancel').onclick=()=>dlg.remove();
+  dlg.querySelector('#acc-cancel').onclick=()=>{ clearTimeout(pollTimer); dlg.remove(); };
   dlg.querySelector('#acc-save').onclick=async()=>{
     try{ await save(); dlg.remove(); renderAccounts(); renderPairs(); toast('Account saved'); }
     catch(e){ dlg.querySelector('#acc-msg').textContent=e.message; }
@@ -225,6 +268,38 @@ function accountForm(id, presetKey){
       toast('Google connected ✓');
     }catch(e){ dlg.querySelector('#acc-msg').textContent=e.message; }
   };
+  const graphBtn=dlg.querySelector('#graph-connect');
+  if(graphBtn) graphBtn.onclick=async()=>{
+    graphBtn.disabled=true;
+    try{
+      const savedId=await save();
+      const r=await api('/api/graph/device/start',{method:'POST',body:JSON.stringify({account:savedId})});
+      const box=dlg.querySelector('#graph-code');
+      box.classList.remove('hidden');
+      dlg.querySelector('#graph-user-code').textContent=r.user_code;
+      if(r.verification_uri) dlg.querySelector('#graph-link').href=r.verification_uri;
+      const wait=dlg.querySelector('#graph-wait');
+      const poll=async()=>{
+        try{
+          const s=await api('/api/graph/device/poll',{method:'POST',body:JSON.stringify({account:savedId})});
+          if(s.connected){
+            CFG=await api('/api/config'); dlg.remove(); renderAccounts(); renderPairs();
+            toast('Microsoft 365 connected ✓'); return;
+          }
+          wait.textContent='waiting for approval…';
+          pollTimer=setTimeout(poll, Math.max(5,(r.interval||5))*1000);
+        }catch(e){
+          graphBtn.disabled=false;
+          dlg.querySelector('#acc-msg').textContent=e.message;
+          wait.textContent='Sign-in stopped. Start it again.';
+        }
+      };
+      pollTimer=setTimeout(poll, Math.max(5,(r.interval||5))*1000);
+    }catch(e){
+      graphBtn.disabled=false;
+      dlg.querySelector('#acc-msg').textContent=e.message;
+    }
+  };
 }
 
 async function delAccount(id){
@@ -235,13 +310,18 @@ async function delAccount(id){
 
 // --- PAIRS ---
 function accountOptions(sel){ return Object.entries(CFG.accounts)
-  .map(([id,a])=>`<option value="${id}" ${id===sel?'selected':''}>${esc(a.name||id)} (${a.kind})</option>`).join(''); }
+  .map(([id,a])=>`<option value="${id}" ${id===sel?'selected':''}>${esc(a.name||id)} (${KIND_LABEL[a.kind]||a.kind})</option>`).join(''); }
 
 function addPair(){
   const ids=Object.keys(CFG.accounts);
   if(ids.length<2){ toast('Add at least two accounts first',true); return; }
   const pid='new_'+Math.random().toString(36).slice(2,8);
-  CFG.pairs[pid]={name:'New pair',service:'calendar',a:ids[0],b:ids[1],direction:'both',conflict_resolution:'a wins',collections:[],labels:{},_new:true};
+  let a=ids[0], b=ids[1], service='calendar', direction='both';
+  const icloud=ids.find(id=>CFG.accounts[id].kind==='icloud');
+  const graph=ids.find(id=>CFG.accounts[id].kind==='graph');
+  if(icloud && graph){ a=icloud; b=graph; service='contacts'; direction='a_to_b'; }
+  else if(graph){ service='contacts'; b=graph; a=ids.find(id=>id!==graph)||ids[0]; direction='a_to_b'; }
+  CFG.pairs[pid]={name:'New pair',service,a,b,direction,conflict_resolution:'a wins',collections:[],labels:{},_new:true};
   renderPairs();
 }
 
@@ -265,6 +345,15 @@ function renderPairs(){
       source side is treated read-only — it's never modified, only the other side
       is updated to match. Conflict resolution (A/B wins) only applies to
       bidirectional mappings.</p>
+      <div id="gwarn-${pid}" class="note warn ${pairHasGraph(pid)?'':'hidden'}">
+        The first sync into a mapped Outlook folder <b>deletes every contact there
+        whose UID is not in the source</b> (iCloud, when that is side A). Create a
+        new empty contact folder in Outlook, or back up the folder, and map only
+        that folder. Outlook receives a reduced contact: birthdays are not written,
+        iPhone-only numbers can be stored as work numbers, and URLs, relations and
+        Apple-only fields are dropped. iCloud stays unchanged while the mapping is
+        one-way. Two-way writes Microsoft's normalized contact back to the other side.
+      </div>
       <h3>Mappings</h3>
       <table class="tbl"><thead><tr><th>Short name</th><th>A</th><th>B</th><th>Direction</th><th></th></tr></thead>
         <tbody id="map-${pid}"></tbody></table>
@@ -282,7 +371,26 @@ function renderPairs(){
     root.appendChild(sec);
     sec.querySelectorAll('[data-p]').forEach(el=>{
       const ev = el.tagName==='SELECT' ? 'change' : 'input';
-      el.addEventListener(ev, ()=>{ CFG.pairs[pid][el.dataset.p]=el.value; markDirty(pid); });
+      el.addEventListener(ev, ()=>{
+        if(el.dataset.p==='service' && el.value==='calendar' && pairHasGraph(pid)){
+          toast('Microsoft 365 Graph only syncs contacts', true);
+          el.value='contacts';
+          return;
+        }
+        CFG.pairs[pid][el.dataset.p]=el.value;
+        if((el.dataset.p==='a'||el.dataset.p==='b') && !(CFG.pairs[pid].collections||[]).length){
+          const d=suggestedDirection(pid);
+          if(d){
+            CFG.pairs[pid].direction=d;
+            if(pairHasGraph(pid)) CFG.pairs[pid].service='contacts';
+            const svc=sec.querySelector('[data-p="service"]');
+            if(svc && pairHasGraph(pid)) svc.value='contacts';
+          }
+        }
+        const warn=document.getElementById('gwarn-'+pid);
+        if(warn) warn.classList.toggle('hidden', !pairHasGraph(pid));
+        markDirty(pid);
+      });
     });
     renderMap(pid);
     if(p._new) markDirty(pid);
@@ -319,7 +427,12 @@ function renderMap(pid){
       `<button class="btn small danger" onclick="delMap('${pid}',${i})">×</button></td>`; tb.appendChild(tr); });
   if(!colls.length) tb.innerHTML='<tr><td colspan="5" class="muted">No mappings yet.</td></tr>';
 }
-function setMapDir(pid,i,v){ const c=CFG.pairs[pid].collections[i];
+function setMapDir(pid,i,v){
+  if(v==='both' && pairHasGraph(pid)){
+    const ok=confirm('Two-way sync writes the Microsoft-normalized contact back to the other side, including iCloud. Birthdays and Apple-only fields are dropped on the Microsoft copy. Continue only if you have a backup of both sides.');
+    if(!ok){ renderMap(pid); return; }
+  }
+  const c=CFG.pairs[pid].collections[i];
   while(c.length<5) c.push(c.length===3?'both':'a wins'); c[3]=v; renderMap(pid); markDirty(pid); }
 function setMapConf(pid,i,v){ const c=CFG.pairs[pid].collections[i];
   while(c.length<5) c.push(c.length===3?'both':'a wins'); c[4]=v; markDirty(pid); }
@@ -396,7 +509,7 @@ function clearDialog(pid, side){
     <h2>Clear on ${esc(accName)} <span class="muted">(side ${side.toUpperCase()})</span></h2>
     <div class="note warn">⚠️ This permanently deletes items from the selected ${one} on
       <b>${esc(accName)}</b>. Use it to empty a side before a one-way first sync (then mirror from
-      the other side).${acc.kind==='google'?'<br>Note: clearing Google is best-effort.':''}</div>
+      the other side).${acc.kind==='google'?'<br>Note: clearing Google is best-effort.':''}${acc.kind==='graph'?'<br>Clearing Microsoft 365 deletes those Outlook contacts. It does not change iCloud.':''}</div>
     <label>Which ${one}?<select id="clr-coll">${collOptions}</select></label>
     ${p.service==='calendar'
       ? `<label>Only items newer than N months <span class="muted">(empty or 0 = everything)</span>
